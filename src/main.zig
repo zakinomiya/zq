@@ -69,7 +69,7 @@ const Tokenizer = struct {
     }
 
     fn isEOL(self: Tokenizer) bool {
-        return self.raw_str.len - 1 == self.state.r;
+        return self.raw_str.len <= self.state.r;
     }
 
     fn current(self: Tokenizer) u8 {
@@ -82,21 +82,6 @@ const Tokenizer = struct {
 
     fn slice(self: Tokenizer) []const u8 {
         return self.raw_str[self.state.l..self.state.r];
-    }
-
-    fn isSignedNum(self: Tokenizer) bool {
-        if (self.raw_str.len <= self.state.r + 1) {
-            return false;
-        }
-
-        const c = self.current();
-        if (c == '+' or c == '-') {
-            if (std.ascii.isDigit(self.next())) {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     // tokenize parses tokens and returns slice of Token.
@@ -117,15 +102,19 @@ const Tokenizer = struct {
         var is_float = false;
         while (self.raw_str.len > self.state.r and is_num) {
             const c = self.current();
-            if (c == ',' or c == '}' or c == ' ') {
-                is_num = false;
-                break;
+            if (!std.ascii.isDigit(c)) {
+                if (c == '.') {
+                    if (is_float) {
+                        std.log.err("invalid token ({c}) at position {d}", .{ c, self.state.r });
+                        return error.InvalidToken;
+                    }
+                    is_float = true;
+                } else {
+                    is_num = false;
+                    break;
+                }
             }
 
-            if (c == '.') {
-                if (is_float) return error.InvalidFloat;
-                is_float = true;
-            }
             self.state.r += 1;
         }
 
@@ -140,69 +129,58 @@ const Tokenizer = struct {
 
     fn readNull(self: Tokenizer) !Token {
         if (self.raw_str.len < self.state.r + 3) {
-            return error.Fail;
+            std.log.err("invalid token at position {d}", .{self.state.r});
+            return error.InvalidToken;
         }
 
-        if (std.mem.eql(u8, self.raw_str[self.state.r .. self.state.r + 4], "null")) {
+        const n = self.raw_str[self.state.r .. self.state.r + 4];
+        self.state.r += 3;
+
+        if (std.mem.eql(u8, n, "null")) {
             return Token{
                 .ty = .Null,
                 .raw = "null",
             };
         } else {
-            return error.Fail;
+            std.log.err("invalid token ({s}) at position {d}", .{ n, self.state.r });
+            return error.InvalidToken;
         }
     }
 
     fn populate(self: *Tokenizer, arr: *std.ArrayList(Token)) !void {
         while (!self.isEOL()) {
             const c = self.current();
-            if (!self.state.inside_string and std.ascii.isSpace(c)) {
-                self.state.skip();
-                continue;
-            }
+            if (!self.state.inside_string) {
+                switch (c) {
+                    ' ' => {}, // ignore
+                    '"' => self.state.inside_string = true,
+                    '+', '-', '0'...'9' => {
+                        self.state.r += 1;
+                        try arr.append(try self.readNumber());
+                    },
+                    'n' => try arr.append(try self.readNull()),
+                    '{' => try arr.append(Token{ .ty = .CurlyBraceOpen, .raw = "{" }),
+                    '}' => try arr.append(Token{ .ty = .CurlyBraceClose, .raw = "}" }),
+                    ':' => try arr.append(Token{ .ty = .Colon, .raw = ":" }),
+                    ',' => try arr.append(Token{ .ty = .Comma, .raw = "," }),
+                    else => {
+                        std.log.err("invalid token ({c}) at position {d}", .{ c, self.state.r });
+                        return error.InvalidToken;
+                    },
+                }
 
-            if (!self.state.inside_string and c == 'n') {
-                try arr.append(try self.readNull());
-                self.state.r += 4;
-                self.state.alignlr();
-                continue;
-            }
-
-            if (self.state.inside_string and c != '"') {
                 self.state.r += 1;
-                continue;
-            }
-
-            if (!self.state.inside_string and (std.ascii.isDigit(c) or self.isSignedNum())) {
-                try arr.append(try self.readNumber());
                 self.state.alignlr();
                 continue;
             }
 
-            switch (c) {
-                '{' => try arr.append(Token{ .ty = .CurlyBraceOpen, .raw = "{" }),
-                '}' => try arr.append(Token{ .ty = .CurlyBraceClose, .raw = "}" }),
-                '"' => {
-                    if (self.state.inside_string) {
-                        if (isEscaped(self.raw_str[self.state.r - 1 .. self.state.r + 1])) {
-                            self.state.r += 1;
-                            continue;
-                        }
-                        // end of string
-                        try arr.append(Token{ .ty = .String, .raw = self.slice() });
-                    }
-                    self.state.inside_string = !self.state.inside_string;
-                },
-                ':' => try arr.append(Token{ .ty = .Colon, .raw = ":" }),
-                ',' => try arr.append(Token{ .ty = .Comma, .raw = "," }),
-                else => {
-                    self.state.r += 1;
-                    continue;
-                },
+            if (c == '"' and !isEscaped(self.raw_str[self.state.r - 1 .. self.state.r + 1])) {
+                // end of string
+                try arr.append(Token{ .ty = .String, .raw = self.slice() });
+                self.state.inside_string = false;
             }
 
             self.state.r += 1;
-            self.state.alignlr();
         }
     }
 };
@@ -211,21 +189,12 @@ pub fn main() anyerror!void {
     std.debug.print("hello", .{});
 }
 
-fn createTestTokens(v: Token) []const Token {
-    return &[_]Token{
-        .{ .ty = .CurlyBraceOpen, .raw = "{" },
-        .{ .ty = .String, .raw = "hello" },
-        .{ .ty = .Colon, .raw = ":" },
-        v,
-        .{ .ty = .CurlyBraceClose, .raw = "}" },
-    };
-}
-
 test "tokenize test" {
     const testcases = &[_]struct {
         in: []const u8,
-        want: []const Token,
+        want: []const Token = undefined,
         expectErr: bool = false,
+        errType: anyerror = undefined,
     }{
         .{
             .in = "{\"hello\": \"world\"}",
@@ -267,11 +236,49 @@ test "tokenize test" {
             .in = "{\"hello\": 0.0}",
             .want = comptime createTestTokens(Token{ .ty = .Number, .raw = "0.0", .fval = -0.0 }),
         },
+        .{
+            .in = "{\"hello\": \"world\", \"hello2\": \"world2\"}",
+            .want = &[_]Token{
+                .{ .ty = .CurlyBraceOpen, .raw = "{" },
+                .{ .ty = .String, .raw = "hello" },
+                .{ .ty = .Colon, .raw = ":" },
+                .{ .ty = .String, .raw = "world" },
+                .{ .ty = .Comma, .raw = "," },
+                .{ .ty = .String, .raw = "hello2" },
+                .{ .ty = .Colon, .raw = ":" },
+                .{ .ty = .String, .raw = "world2" },
+                .{ .ty = .CurlyBraceClose, .raw = "}" },
+            },
+        },
+        .{
+            .in = "{\"hello\": { \"world\": 10 } }",
+            .want = &[_]Token{
+                .{ .ty = .CurlyBraceOpen, .raw = "{" },
+                .{ .ty = .String, .raw = "hello" },
+                .{ .ty = .Colon, .raw = ":" },
+                .{ .ty = .CurlyBraceOpen, .raw = "{" },
+                .{ .ty = .String, .raw = "world" },
+                .{ .ty = .Colon, .raw = ":" },
+                .{ .ty = .Number, .raw = "10", .ival = 10 },
+                .{ .ty = .CurlyBraceClose, .raw = "}" },
+                .{ .ty = .CurlyBraceClose, .raw = "}" },
+            },
+        },
+        .{ .in = "{\"hello\": 0.0.0}", .expectErr = true, .errType = error.InvalidToken },
+        .{ .in = "{\"hello\": hello}", .expectErr = true, .errType = error.InvalidToken },
+        .{ .in = "{hello: world}", .expectErr = true, .errType = error.InvalidToken },
+        .{ .in = "{100: hello}", .expectErr = true, .errType = error.InvalidToken },
+        .{ .in = "{\"hello\": nul}", .expectErr = true, .errType = error.InvalidToken },
     };
 
-    for (testcases) |tc| {
+    for (testcases) |tc, ti| {
+        std.log.warn("test case #{d}", .{ti + 1});
         var tokenizer = try Tokenizer.init(std.testing.allocator, tc.in);
         defer tokenizer.deinit();
+        if (tc.expectErr) {
+            try std.testing.expectError(tc.errType, tokenizer.tokenize());
+            continue;
+        }
         const result = try tokenizer.tokenize();
         defer std.testing.allocator.free(result);
 
@@ -282,4 +289,14 @@ test "tokenize test" {
             if (r.fval) |v| try std.testing.expectEqual(v, tc.want[i].fval.?);
         }
     }
+}
+
+fn createTestTokens(v: Token) []const Token {
+    return &[_]Token{
+        .{ .ty = .CurlyBraceOpen, .raw = "{" },
+        .{ .ty = .String, .raw = "hello" },
+        .{ .ty = .Colon, .raw = ":" },
+        v,
+        .{ .ty = .CurlyBraceClose, .raw = "}" },
+    };
 }
