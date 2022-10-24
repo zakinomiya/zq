@@ -3,28 +3,24 @@ const lexer = @import("lexer.zig");
 const Token = lexer.Token;
 const TokenType = lexer.TokenType;
 
-const Nodes = std.ArrayList(Node);
+const Objects = std.ArrayList(Object);
 
-const Value = union(enum) {
+pub const Value = union(enum) {
     string: []const u8,
     boolean: bool,
     integer: i64,
     float: f64,
-    object: []Node,
-    array: []Node,
+    object: []Object,
+    array: []Value,
     nul: bool,
 };
 
-const Key = struct {
+pub const Object = struct {
     key: []const u8,
+    value: *Value,
 };
 
-const Node = union(enum) {
-    key: Key,
-    value: Value,
-};
-
-const Parser = struct {
+pub const Parser = struct {
     allocator: std.mem.Allocator,
     state: *State,
     tokens: []Token,
@@ -67,11 +63,11 @@ const Parser = struct {
         _ = try self.expect(ty);
     }
 
-    fn parseArray(self: *Parser) ![]Node {
+    fn parseArray(self: *Parser) ![]Value {
         try self.expectSkip(.BracketOpen);
-        var arr = try self.allocator.create(Nodes);
-        self.allocator.destroy(arr);
-        arr.* = Nodes.init(self.allocator);
+        var arr = try self.allocator.create(std.ArrayList(Value));
+        defer self.allocator.destroy(arr);
+        arr.* = std.ArrayList(Value).init(self.allocator);
         defer arr.deinit();
 
         while (true) {
@@ -86,12 +82,9 @@ const Parser = struct {
         return arr.toOwnedSlice();
     }
 
-    fn parseValue(self: *Parser) anyerror!Node {
+    fn parseValue(self: *Parser) anyerror!Value {
         const cur = self.current();
-        var val = try self.allocator.create(Value);
-        defer self.allocator.destroy(val);
-
-        val.* = switch (cur.ty) {
+        var val = switch (cur.ty) {
             .String => Value{ .string = cur.raw },
             .Number => if (cur.num_val.? == .integer)
                 Value{ .integer = cur.num_val.?.integer }
@@ -100,7 +93,10 @@ const Parser = struct {
             .CurlyBraceOpen => Value{ .object = try self.parseJson() },
             .BracketOpen => Value{ .array = try self.parseArray() },
             .Null => Value{ .nul = true },
-            .Boolean => Value{ .boolean = if (std.mem.eql(u8, cur.raw, "true")) true else false },
+            .Boolean => if (std.mem.eql(u8, cur.raw, "true"))
+                Value{ .boolean = true }
+            else
+                Value{ .boolean = false },
             else => {
                 std.log.err("expected start of value at position {d} but type is {}", .{ cur.pos, cur.ty });
                 return error.InvalidSyntax;
@@ -118,31 +114,35 @@ const Parser = struct {
             else => {},
         }
 
-        return Node{ .value = val.* };
+        return val;
     }
 
-    fn parseNode(self: *Parser, arr: *Nodes) !void {
+    fn parseObject(self: *Parser, arr: *Objects) !void {
         const key = self.expect(.String) catch {
             std.log.err("no key found. object must be in the form of 'key: value'", .{});
             return error.NoKey;
         };
 
-        std.log.err("key={s}", .{key.raw});
-        try arr.append(Node{ .key = Key{ .key = key.raw } });
         try self.expectSkip(.Colon);
-        try arr.append(try self.parseValue());
+        var val = try self.allocator.create(Value);
+        val.* = try self.parseValue();
+        var node = Object{
+            .key = key.raw,
+            .value = val,
+        };
+        try arr.append(node);
     }
 
-    fn parseJson(self: *Parser) anyerror![]Node {
+    fn parseJson(self: *Parser) anyerror![]Object {
         try self.expectSkip(.CurlyBraceOpen);
 
-        var arr = try self.allocator.create(Nodes);
+        var arr = try self.allocator.create(Objects);
         defer self.allocator.destroy(arr);
-        arr.* = Nodes.init(self.allocator);
+        arr.* = Objects.init(self.allocator);
         defer arr.deinit();
 
         while (true) {
-            try self.parseNode(arr);
+            try self.parseObject(arr);
             if (self.current().ty != .Comma) {
                 break;
             }
@@ -153,28 +153,60 @@ const Parser = struct {
         return arr.toOwnedSlice();
     }
 
-    // parse parses tokens and returns list of Node
-    // caller own the returned memory
-    fn parse(self: *Parser) ![]Node {
+    /// parse parses tokens and returns list of Object.
+    /// Caller must call freeObjects on result
+    pub fn parse(self: *Parser) ![]Object {
         return try self.parseJson();
     }
 };
 
+/// freeObjects recursively frees all the nodes allocated by Parser.parse.
+pub fn freeObjects(allocator: std.mem.Allocator, nodes: []Object) void {
+    defer allocator.free(nodes);
+    for (nodes) |n| {
+        defer allocator.destroy(n.value);
+        switch (n.value.*) {
+            .array => |v| {
+                freeValues(allocator, v);
+            },
+            .object => |v| {
+                freeObjects(allocator, v);
+            },
+            else => {},
+        }
+    }
+}
+
+fn freeValues(allocator: std.mem.Allocator, values: []Value) void {
+    defer allocator.free(values);
+    for (values) |val| {
+        switch (val) {
+            .array => |v| {
+                freeValues(allocator, v);
+            },
+            .object => |v| {
+                freeObjects(allocator, v);
+            },
+            else => {},
+        }
+    }
+}
+
 test "test parse" {
     const tokens = &[_]Token{
         .{ .ty = .CurlyBraceOpen, .pos = 0, .raw = "{" },
-        .{ .ty = .String, .pos = 2, .raw = "hello" },
-        .{ .ty = .Colon, .pos = 8, .raw = ":" },
+        .{ .ty = .String, .pos = 0, .raw = "hello" },
+        .{ .ty = .Colon, .pos = 0, .raw = ":" },
         .{ .ty = .CurlyBraceOpen, .pos = 0, .raw = "{" },
-        .{ .ty = .String, .pos = 2, .raw = "hello" },
-        .{ .ty = .Colon, .pos = 8, .raw = ":" },
+        .{ .ty = .String, .pos = 0, .raw = "hello" },
+        .{ .ty = .Colon, .pos = 0, .raw = ":" },
         .{ .ty = .CurlyBraceOpen, .pos = 0, .raw = "{" },
-        .{ .ty = .String, .pos = 2, .raw = "hello" },
-        .{ .ty = .Colon, .pos = 8, .raw = ":" },
-        .{ .ty = .String, .pos = 10, .raw = "world" },
-        .{ .ty = .CurlyBraceClose, .pos = 17, .raw = "}" },
-        .{ .ty = .CurlyBraceClose, .pos = 17, .raw = "}" },
-        .{ .ty = .CurlyBraceClose, .pos = 17, .raw = "}" },
+        .{ .ty = .String, .pos = 0, .raw = "hello" },
+        .{ .ty = .Colon, .pos = 0, .raw = ":" },
+        .{ .ty = .String, .pos = 0, .raw = "world" },
+        .{ .ty = .CurlyBraceClose, .pos = 0, .raw = "}" },
+        .{ .ty = .CurlyBraceClose, .pos = 0, .raw = "}" },
+        .{ .ty = .CurlyBraceClose, .pos = 0, .raw = "}" },
     };
 
     var toks = try std.testing.allocator.alloc(Token, tokens.len);
@@ -190,23 +222,5 @@ test "test parse" {
     defer parser.deinit();
 
     const nodes = try parser.parse();
-    defer std.testing.allocator.free(nodes);
-    free(nodes, std.testing.allocator);
-}
-
-fn free(nodes: []Node, allocator: std.mem.Allocator) void {
-    for (nodes) |n| {
-        switch (n) {
-            .value => |v| switch (v) {
-                .object,
-                .array,
-                => |vv| {
-                    free(vv, allocator);
-                    allocator.free(vv);
-                },
-                else => {},
-            },
-            .key => {},
-        }
-    }
+    defer freeObjects(std.testing.allocator, nodes);
 }
