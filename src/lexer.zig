@@ -1,21 +1,14 @@
-const std = @import("std"); 
+const std = @import("std");
 
 pub const Node = struct {
     key: []const u8,
     value: *Node,
 };
 
-pub const ValueType = enum {
-    Null,
-    Number,
-    String,
-    Object,
-    Array,
-};
-
 pub const TokenType = enum {
     String,
-    Number,
+    Integer,
+    Float,
     Boolean,
     Null,
     Colon,
@@ -26,14 +19,8 @@ pub const TokenType = enum {
     BracketClose,
 };
 
-pub const NumValue = union(enum) {
-    integer: i64,
-    float: f64,
-};
-
 pub const Token = struct {
     raw: []const u8,
-    num_val: ?NumValue = null,
     pos: usize,
     ty: TokenType,
 
@@ -45,19 +32,17 @@ pub const Token = struct {
         };
     }
 
-    pub fn newInt(pos: usize, val: i64, raw: []const u8) Token {
+    pub fn newInt(pos: usize, raw: []const u8) Token {
         return Token{
-            .ty = .Number,
-            .num_val = NumValue{ .integer = val },
+            .ty = .Integer,
             .pos = pos,
             .raw = raw,
         };
     }
 
-    pub fn newFloat(pos: usize, val: f64, raw: []const u8) Token {
+    pub fn newFloat(pos: usize, raw: []const u8) Token {
         return Token{
-            .ty = .Number,
-            .num_val = NumValue{ .float = val },
+            .ty = .Float,
             .pos = pos,
             .raw = raw,
         };
@@ -132,7 +117,7 @@ fn isEscaped(s: []const u8) bool {
     return std.mem.eql(u8, s, "\\\"");
 }
 
-const Tokenizer = struct {
+pub const Tokenizer = struct {
     allocator: std.mem.Allocator,
     raw_str: []const u8,
     state: *State,
@@ -187,9 +172,9 @@ const Tokenizer = struct {
         return self.raw_str[self.state.l..self.state.r];
     }
 
-    // tokenize parses tokens and returns slice of Token.
-    // caller owns the returned memory.
-    pub fn tokenize(self: *Tokenizer) ![]const Token {
+    /// tokenize parses tokens and returns slice of Token.
+    /// caller owns the returned memory.
+    pub fn tokenize(self: *Tokenizer) ![]Token {
         var arr = try self.allocator.create(std.ArrayList(Token));
         defer self.allocator.destroy(arr);
 
@@ -200,17 +185,34 @@ const Tokenizer = struct {
         return arr.toOwnedSlice();
     }
 
-    fn readNumber(self: Tokenizer) !Token {
+    fn readBool(self: Tokenizer, is_true: bool) !Token {
+        if (self.raw_str.len < self.state.r + 3) {
+            std.log.info("invalid token at position {d}", .{self.state.r});
+            return error.InvalidToken;
+        }
+
+        const until: usize = if (is_true)
+            4 // true
+        else
+            5; // false
+        const n = self.raw_str[self.state.r .. self.state.r + until];
+        self.state.r += until - 1;
+
+        if (std.mem.eql(u8, n, "true") or std.mem.eql(u8, n, "false")) {
+            return Token.newBool(self.state.l, is_true);
+        } else {
+            std.log.info("invalid token ({s}) at position {d}", .{ n, self.state.r });
+            return error.InvalidToken;
+        }
+    }
+
+    fn readNumber(self: Tokenizer) Token {
         var is_num = true;
         var is_float = false;
         while (self.raw_str.len > self.state.r and is_num) {
             const c = self.current();
             if (!std.ascii.isDigit(c)) {
-                if (c == '.') {
-                    if (is_float) {
-                        std.log.info("invalid token ({c}) at position {d}", .{ c, self.state.r });
-                        return error.InvalidToken;
-                    }
+                if (c == '.' or c == 'e' or c == '+') {
                     is_float = true;
                 } else {
                     is_num = false;
@@ -223,9 +225,9 @@ const Tokenizer = struct {
 
         const r = self.slice();
         return if (is_float)
-            Token.newFloat(self.state.l, try std.fmt.parseFloat(f64, r), r)
+            Token.newFloat(self.state.l, r)
         else
-            Token.newInt(self.state.l, try std.fmt.parseInt(i64, r, 10), r);
+            Token.newInt(self.state.l, r);
     }
 
     fn readNull(self: Tokenizer) !Token {
@@ -247,17 +249,19 @@ const Tokenizer = struct {
 
     fn read(self: *Tokenizer, c: u8) !?Token {
         return switch (c) {
-            ' ' => null, // ignore
+            ' ', '\n', 170 => null, // ignore
             '"' => {
                 self.state.inside_string = true;
                 return null;
             },
             '+', '-', '0'...'9' => {
                 self.state.r += 1;
-                const t = try self.readNumber();
+                const t = self.readNumber();
                 self.state.r -= 1;
                 return t;
             },
+            't' => try self.readBool(true),
+            'f' => try self.readBool(false),
             'n' => try self.readNull(),
             '[' => Token.newBracketOpen(self.state.l),
             ']' => Token.newBracketClose(self.state.l),
@@ -266,7 +270,7 @@ const Tokenizer = struct {
             ':' => Token.newColon(self.state.l),
             ',' => Token.newComma(self.state.l),
             else => {
-                std.log.info("invalid token ({c}) at position {d}", .{ c, self.state.r });
+                std.log.info("invalid token ({c} i={d}) at position {d} reading {s}", .{ c, c, self.state.r, self.raw_str[self.state.r - 5 .. self.state.r + 5] });
                 return error.InvalidToken;
             },
         };
@@ -321,31 +325,31 @@ test "tokenize test" {
         },
         .{
             .in = "{\"hello\":10}",
-            .want = comptime createTestTokens(.{ .raw = "10", .pos = 9, .ty = .Number, .num_val = NumValue{ .integer = 10 } }),
+            .want = comptime createTestTokens(.{ .raw = "10", .pos = 9, .ty = .Integer }),
         },
         .{
             .in = "{\"hello\":+10}",
-            .want = comptime createTestTokens(.{ .raw = "+10", .pos = 9, .ty = .Number, .num_val = NumValue{ .integer = 10 } }),
+            .want = comptime createTestTokens(.{ .raw = "+10", .pos = 9, .ty = .Integer }),
         },
         .{
             .in = "{\"hello\":-10}",
-            .want = comptime createTestTokens(.{ .raw = "-10", .pos = 9, .ty = .Number, .num_val = NumValue{ .integer = -10 } }),
+            .want = comptime createTestTokens(.{ .raw = "-10", .pos = 9, .ty = .Integer }),
         },
         .{
             .in = "{\"hello\":10.5}",
-            .want = comptime createTestTokens(.{ .raw = "10.5", .pos = 9, .ty = .Number, .num_val = NumValue{ .float = 10.5 } }),
+            .want = comptime createTestTokens(.{ .raw = "10.5", .pos = 9, .ty = .Float }),
         },
         .{
             .in = "{\"hello\":+10.5}",
-            .want = comptime createTestTokens(.{ .raw = "+10.5", .pos = 9, .ty = .Number, .num_val = NumValue{ .float = 10.5 } }),
+            .want = comptime createTestTokens(.{ .raw = "+10.5", .pos = 9, .ty = .Float }),
         },
         .{
             .in = "{\"hello\":-10.5}",
-            .want = comptime createTestTokens(.{ .raw = "-10.5", .pos = 9, .ty = .Number, .num_val = NumValue{ .float = -10.5 } }),
+            .want = comptime createTestTokens(.{ .raw = "-10.5", .pos = 9, .ty = .Float }),
         },
         .{
             .in = "{\"hello\":0.0}",
-            .want = comptime createTestTokens(.{ .raw = "0.0", .pos = 9, .ty = .Number, .num_val = NumValue{ .float = 0.0 } }),
+            .want = comptime createTestTokens(.{ .raw = "0.0", .pos = 9, .ty = .Float }),
         },
 
         .{
@@ -371,7 +375,7 @@ test "tokenize test" {
                 .{ .ty = .CurlyBraceOpen, .pos = 9, .raw = "{" },
                 .{ .ty = .String, .pos = 11, .raw = "world" },
                 .{ .ty = .Colon, .pos = 17, .raw = ":" },
-                .{ .ty = .Number, .pos = 18, .raw = "10", .num_val = NumValue{ .integer = 10 } },
+                .{ .ty = .Integer, .pos = 18, .raw = "10" },
                 .{ .ty = .CurlyBraceClose, .pos = 20, .raw = "}" },
                 .{ .ty = .CurlyBraceClose, .pos = 21, .raw = "}" },
             },
@@ -413,9 +417,6 @@ test "tokenize test" {
             try std.testing.expectEqual(tc.want[i].ty, r.ty);
             try std.testing.expectEqual(tc.want[i].pos, r.pos);
             try std.testing.expectEqualSlices(u8, tc.want[i].raw, r.raw);
-            if (r.num_val) |v| {
-                try std.testing.expectEqual(v, tc.want[i].num_val.?);
-            }
         }
     }
 }

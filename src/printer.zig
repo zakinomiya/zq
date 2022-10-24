@@ -5,9 +5,9 @@ const parser = @import("./parser.zig");
 const Object = parser.Object;
 const Value = parser.Value;
 
-const Printer = struct {
+pub const Printer = struct {
     allocator: std.mem.Allocator,
-    objects: []Object,
+    toplevel: Object,
     config: PrinterConfig,
     indent_char: u8,
     writer: std.fs.File.Writer,
@@ -43,7 +43,7 @@ const Printer = struct {
         self.allocator.destroy(self.state);
     }
 
-    pub fn init(allocator: std.mem.Allocator, printer_config: PrinterConfig, objects: []Object) !Printer {
+    pub fn init(allocator: std.mem.Allocator, printer_config: PrinterConfig, toplevel: Object) !Printer {
         var f = switch (printer_config.output) {
             .Stdio => std.io.getStdOut(),
             .File => try std.fs.createFileAbsolute(printer_config.output_name.?, std.fs.File.CreateFlags{}),
@@ -53,7 +53,7 @@ const Printer = struct {
 
         return Printer{
             .allocator = allocator,
-            .objects = objects,
+            .toplevel = toplevel,
             .config = printer_config,
             .indent_char = if (printer_config.indent_mode == .Space) ' ' else '\t',
             .writer = f.writer(),
@@ -85,19 +85,12 @@ const Printer = struct {
 
     fn printValue(self: Printer, val: *Value) anyerror!void {
         switch (val.*) {
-            .boolean => |v| if (v) {
-                _ = try self.writer.write("true");
-            } else {
-                _ = try self.writer.write("false");
-            },
-            .integer => |v| {
-                try self.writer.print("{d}", .{v});
-            },
-            .float => |v| {
-                try self.writer.print("{}", .{v});
-            },
-            .nul => {
-                _ = try self.writer.write("null");
+            .boolean,
+            .integer,
+            .float,
+            .nul,
+            => |v| {
+                _ = try self.writer.write(v);
             },
             .string => |v| {
                 try self.writeString(v);
@@ -142,7 +135,7 @@ const Printer = struct {
         try self.printValue(obj.value);
     }
 
-    pub fn printObject(self: Printer, obj: []Object) !void {
+    fn printObject(self: Printer, obj: []Object) !void {
         // {
         try self.writer.writeByte('{');
         try self.writeByteIfPretty('\n');
@@ -163,77 +156,11 @@ const Printer = struct {
     }
 
     pub fn print(self: Printer) !void {
-        try self.printObject(self.objects);
+        switch (self.toplevel.value.*) {
+            .object => |v| try self.printObject(v),
+            .array => |v| try self.printArray(v),
+            else => return error.InvalidToplevelObj,
+        }
         try self.writeByteIfPretty('\n');
     }
 };
-
-pub fn main() !void {
-    const tokens = &[_]Token{
-        .{ .ty = .CurlyBraceOpen, .pos = 0, .raw = "{" },
-        .{ .ty = .String, .pos = 0, .raw = "hello" },
-        .{ .ty = .Colon, .pos = 0, .raw = ":" },
-        .{ .ty = .CurlyBraceOpen, .pos = 0, .raw = "{" },
-        .{ .ty = .String, .pos = 0, .raw = "hello" },
-        .{ .ty = .Colon, .pos = 0, .raw = ":" },
-        .{ .ty = .CurlyBraceOpen, .pos = 0, .raw = "{" },
-        .{ .ty = .String, .pos = 0, .raw = "hello" },
-        .{ .ty = .Colon, .pos = 0, .raw = ":" },
-        .{ .ty = .String, .pos = 0, .raw = "world" },
-        .{ .ty = .Comma, .pos = 0, .raw = "," },
-        .{ .ty = .String, .pos = 0, .raw = "h" },
-        .{ .ty = .Colon, .pos = 0, .raw = ":" },
-        .{ .ty = .Null, .pos = 0, .raw = "null" },
-        .{ .ty = .Comma, .pos = 0, .raw = "," },
-        .{ .ty = .String, .pos = 0, .raw = "hello2" },
-        .{ .ty = .Colon, .pos = 0, .raw = ":" },
-        .{ .ty = .String, .pos = 0, .raw = "world" },
-        .{ .ty = .Comma, .pos = 0, .raw = "," },
-        .{ .ty = .String, .pos = 0, .raw = "array" },
-        .{ .ty = .Colon, .pos = 0, .raw = ":" },
-        .{ .ty = .BracketOpen, .pos = 0, .raw = "[" },
-        .{ .ty = .String, .pos = 0, .raw = "hello2" },
-        .{ .ty = .Comma, .pos = 0, .raw = "," },
-        .{ .ty = .String, .pos = 0, .raw = "hello3" },
-        .{ .ty = .Comma, .pos = 0, .raw = "," },
-        .{ .ty = .CurlyBraceOpen, .pos = 0, .raw = "{" },
-        .{ .ty = .String, .pos = 0, .raw = "hello" },
-        .{ .ty = .Colon, .pos = 0, .raw = ":" },
-        .{ .ty = .String, .pos = 0, .raw = "world" },
-        .{ .ty = .Comma, .pos = 0, .raw = "," },
-        .{ .ty = .String, .pos = 0, .raw = "hello2" },
-        .{ .ty = .Colon, .pos = 0, .raw = ":" },
-        .{ .ty = .String, .pos = 0, .raw = "world" },
-        .{ .ty = .Comma, .pos = 0, .raw = "," },
-        .{ .ty = .String, .pos = 0, .raw = "array" },
-        .{ .ty = .Colon, .pos = 0, .raw = ":" },
-        .{ .ty = .BracketOpen, .pos = 0, .raw = "[" },
-        .{ .ty = .String, .pos = 0, .raw = "hello2" },
-        .{ .ty = .Comma, .pos = 0, .raw = "," },
-        .{ .ty = .String, .pos = 0, .raw = "hello3" },
-        .{ .ty = .BracketClose, .pos = 0, .raw = "]" },
-        .{ .ty = .CurlyBraceClose, .pos = 0, .raw = "}" },
-        .{ .ty = .BracketClose, .pos = 0, .raw = "]" },
-        .{ .ty = .CurlyBraceClose, .pos = 0, .raw = "}" },
-        .{ .ty = .CurlyBraceClose, .pos = 0, .raw = "}" },
-        .{ .ty = .CurlyBraceClose, .pos = 0, .raw = "}" },
-    };
-
-    var toks = try std.testing.allocator.alloc(Token, tokens.len);
-    defer std.testing.allocator.free(toks);
-    for (tokens) |tok, i| {
-        toks[i] = tok;
-    }
-
-    var p = try parser.Parser.init(
-        std.testing.allocator,
-        toks,
-    );
-    defer p.deinit();
-
-    const nodes = try p.parse();
-    defer parser.freeObjects(std.testing.allocator, nodes);
-
-    var printer = try Printer.init(std.testing.allocator, .{}, nodes);
-    try printer.print();
-}

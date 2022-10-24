@@ -7,12 +7,12 @@ const Objects = std.ArrayList(Object);
 
 pub const Value = union(enum) {
     string: []const u8,
-    boolean: bool,
-    integer: i64,
-    float: f64,
+    boolean: []const u8,
+    integer: []const u8,
+    float: []const u8,
     object: []Object,
     array: []Value,
-    nul: bool,
+    nul: []const u8,
 };
 
 pub const Object = struct {
@@ -86,17 +86,12 @@ pub const Parser = struct {
         const cur = self.current();
         var val = switch (cur.ty) {
             .String => Value{ .string = cur.raw },
-            .Number => if (cur.num_val.? == .integer)
-                Value{ .integer = cur.num_val.?.integer }
-            else
-                Value{ .float = cur.num_val.?.float },
+            .Integer => Value{ .integer = cur.raw },
+            .Float => Value{ .float = cur.raw },
             .CurlyBraceOpen => Value{ .object = try self.parseJson() },
             .BracketOpen => Value{ .array = try self.parseArray() },
-            .Null => Value{ .nul = true },
-            .Boolean => if (std.mem.eql(u8, cur.raw, "true"))
-                Value{ .boolean = true }
-            else
-                Value{ .boolean = false },
+            .Null => Value{ .nul = "null" },
+            .Boolean => Value{ .boolean = cur.raw },
             else => {
                 std.log.err("expected start of value at position {d} but type is {}", .{ cur.pos, cur.ty });
                 return error.InvalidSyntax;
@@ -105,7 +100,8 @@ pub const Parser = struct {
 
         switch (cur.ty) {
             .String,
-            .Number,
+            .Integer,
+            .Float,
             .Null,
             .Boolean,
             => {
@@ -155,13 +151,37 @@ pub const Parser = struct {
 
     /// parse parses tokens and returns list of Object.
     /// Caller must call freeObjects on result
-    pub fn parse(self: *Parser) ![]Object {
-        return try self.parseJson();
+    pub fn parse(self: *Parser) !Object {
+        var val = try self.allocator.create(Value);
+        switch (self.current().ty) {
+            .CurlyBraceOpen => {
+                var obj = try self.parseJson();
+                val.* = Value{ .object = obj };
+            },
+            .BracketOpen => {
+                var arr = try self.parseArray();
+                val.* = Value{ .array = arr };
+            },
+            else => return error.InvalidSyntax,
+        }
+
+        return Object{
+            .key = "toplevel",
+            .value = val,
+        };
     }
 };
 
-/// freeObjects recursively frees all the nodes allocated by Parser.parse.
-pub fn freeObjects(allocator: std.mem.Allocator, nodes: []Object) void {
+/// freeJson recursively frees all the nodes allocated by Parser.parse.
+pub fn freeJson(allocator: std.mem.Allocator, json: Object) void {
+    switch (json.value.*) {
+        .object => |v| freeObjects(allocator, v),
+        .array => |v| freeValues(allocator, v),
+        else => {},
+    }
+}
+
+fn freeObjects(allocator: std.mem.Allocator, nodes: []Object) void {
     defer allocator.free(nodes);
     for (nodes) |n| {
         defer allocator.destroy(n.value);
@@ -221,6 +241,6 @@ test "test parse" {
     );
     defer parser.deinit();
 
-    const nodes = try parser.parse();
-    defer freeObjects(std.testing.allocator, nodes);
+    const json = try parser.parse();
+    defer freeJson(std.testing.allocator, json);
 }
